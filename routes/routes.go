@@ -1,16 +1,16 @@
 package routes
 
 import (
-	"rest-api-logs/handlers"
+	"app-logs/handlers"
 
 	"github.com/gin-gonic/gin"
 )
 
-func SetupRoutes(
-	router *gin.Engine,
-	logsHandler *handlers.LogsHandler,
-	appsHandler *handlers.AppsHandler,
-) {
+// SetupRouter sets up all the routes for the application
+func SetupRouter(logsHandler *handlers.LogsHandler, appsHandler *handlers.AppsHandler) *gin.Engine {
+	// Set up Gin router
+	router := gin.Default()
+
 	// Logs routes
 	router.GET("/savedlogs/:folder/:file", logsHandler.APIHandler)
 	router.GET("/getlogs", logsHandler.APIFETCHANDLER)
@@ -22,4 +22,7 @@ func SetupRoutes(
 	router.GET("/impression", appsHandler.GetImpression)
 	router.GET("/impression_hourly", appsHandler.HourlyGetImpression)
 	router.GET("/country_timezone", appsHandler.GetTimezone)
+	router.GET("/impression_by_company", appsHandler.GetImpressionByCompany)
+
+	return router
 }

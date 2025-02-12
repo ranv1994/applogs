@@ -9,12 +9,12 @@ import (
 	"log"
 	"math"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/redis/go-redis/v9"
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
@@ -41,9 +41,10 @@ type PostStr struct {
 }
 
 type HourlyImpression struct {
-	Count        int64  `json:"count"`
-	Range        string `json:"range"`
-	IdBasedCount map[int32]int32
+	Count             int64           `json:"count"`
+	Range             string          `json:"range"`
+	IdBasedCount      map[int32]int32 `json:"idBasedCount,omitempty"`
+	CompanyBasedCount map[int32]int32 `json:"companyBasedCount,omitempty"`
 }
 
 type HourlyResponse struct {
@@ -73,6 +74,15 @@ type CompanyAd struct {
 	Company json.Number `json:"company"`
 }
 
+// Cache data structure
+type CachedImpressionData struct {
+	Timestamp int64  `json:"timestamp"`
+	AdID      int32  `json:"ad_id"`
+	Company   int32  `json:"company"`
+	Type      int32  `json:"type"`
+	Country   string `json:"country"`
+}
+
 func NewAppsHandler(cfg *config.Config, mongodb *db.MongoDB, redisDB *db.Redis) *AppsHandler {
 	return &AppsHandler{
 		cfg:     cfg,
@@ -81,22 +91,22 @@ func NewAppsHandler(cfg *config.Config, mongodb *db.MongoDB, redisDB *db.Redis) 
 	}
 }
 
-func (h *AppsHandler) saveToCache(key string, data interface{}, expiration time.Duration) error {
-	jsonData, err := json.Marshal(data)
-	if err != nil {
-		return err
+func (h *AppsHandler) saveToCache(key string, value interface{}, expiration time.Duration) error {
+	if h.redisDB == nil {
+		return nil // Silently ignore if no cache is available
 	}
-	return h.redisDB.Client.Set(context.Background(), key, jsonData, expiration).Err()
+
+	// Use the Redis interface method which handles both Redis and memory cache
+	return h.redisDB.Set(key, value, expiration)
 }
 
-func (h *AppsHandler) getFromCache(key string, data interface{}) error {
-	jsonData, err := h.redisDB.Client.Get(context.Background(), key).Result()
-	if err == redis.Nil {
-		return fmt.Errorf("key not found in cache")
-	} else if err != nil {
-		return err
+func (h *AppsHandler) getFromCache(key string, value interface{}) error {
+	if h.redisDB == nil {
+		return db.ErrCacheMiss
 	}
-	return json.Unmarshal([]byte(jsonData), data)
+
+	// Use the Redis interface method which handles both Redis and memory cache
+	return h.redisDB.Get(key, value)
 }
 
 func (h *AppsHandler) errorRes(c *gin.Context, message string) {
@@ -335,16 +345,6 @@ func (h *AppsHandler) SaveAppData(c *gin.Context) {
 	if strings.Contains(postData.Country, "0") {
 		countryN = h.countryNameReturn(postData.Country)
 	}
-	
-	companyID := postData.ComapnyId
-	if companyID == 0 {
-		fetchedCompanyID, err := h.getcompanyId(postData.Ad_id)
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Failed to fetch company ID: %v", err)})
-			return
-		}
-		companyID = fetchedCompanyID
-	}
 
 	document := bson.M{
 		"firebase":  postData.Firebase,
@@ -353,7 +353,7 @@ func (h *AppsHandler) SaveAppData(c *gin.Context) {
 		"type":      atype,
 		"ads_name":  postData.Ads_name,
 		"country":   countryN,
-		"company":   companyID,
+		"company":   postData.ComapnyId,
 	}
 
 	_, err = collection.InsertOne(context.Background(), document)
@@ -422,40 +422,36 @@ func (h *AppsHandler) SaveAppDataTest(c *gin.Context) {
 
 // Helper methods
 func (h *AppsHandler) getcompanyId(adId int32) (int32, error) {
-	cacheKey := fmt.Sprintf("company_ad_%d", adId)
-	var cachedCompany CompanyAd
+	cacheKey := "company_ads_list"
+	var cachedCompanies []CompanyAd
 
-	err := h.getFromCache(cacheKey, &cachedCompany)
-	if err == nil {
-		id, err := cachedCompany.Company.Int64()
+	err := h.getFromCache(cacheKey, &cachedCompanies)
+	if err != nil {
+		// Cache miss - fetch from API
+		resp, err := http.Get("https://dev.cricket.entitysport.com/user/companies_ads")
 		if err != nil {
-			return 0, fmt.Errorf("invalid company ID format: %v", err)
+			return 0, fmt.Errorf("error fetching JSON data: %v", err)
 		}
-		return int32(id), nil
+		defer resp.Body.Close()
+
+		body, err := ioutil.ReadAll(resp.Body)
+		if err != nil {
+			return 0, fmt.Errorf("error reading response body: %v", err)
+		}
+
+		if err := json.Unmarshal(body, &cachedCompanies); err != nil {
+			log.Printf("Raw response: %s", string(body))
+			return 0, fmt.Errorf("error unmarshalling JSON: %v", err)
+		}
+
+		// Store full response in cache
+		if err := h.saveToCache(cacheKey, cachedCompanies, 10*time.Minute); err != nil {
+			log.Printf("warning: failed to store data in cache: %v", err)
+		}
 	}
 
-	resp, err := http.Get("https://dev.cricket.entitysport.com/user/companies_ads")
-	if err != nil {
-		return 0, fmt.Errorf("error fetching JSON data: %v", err)
-	}
-	defer resp.Body.Close()
-
-	body, err := ioutil.ReadAll(resp.Body)
-	if err != nil {
-		return 0, fmt.Errorf("error reading response body: %v", err)
-	}
-
-	var companies []CompanyAd
-	if err := json.Unmarshal(body, &companies); err != nil {
-		log.Printf("Raw response: %s", string(body))
-		return 0, fmt.Errorf("error unmarshalling JSON: %v", err)
-	}
-
-	if err := h.saveToCache(cacheKey, companies, 10*time.Minute); err != nil {
-		log.Printf("warning: failed to store data in cache: %v", err)
-	}
-
-	for _, company := range companies {
+	// Loop through cached companies to find matching ad ID
+	for _, company := range cachedCompanies {
 		id, err := company.ID.Int64()
 		if err != nil {
 			continue
@@ -471,7 +467,6 @@ func (h *AppsHandler) getcompanyId(adId int32) (int32, error) {
 
 	return 0, errors.New("id not found")
 }
-
 func (h *AppsHandler) countryNameReturn(country string) string {
 	countryMap := map[string]string{
 		"+0430%u": "af",
@@ -622,6 +617,17 @@ func (h *AppsHandler) handleTodayImpression(c *gin.Context, collection *mongo.Co
 }
 
 func (h *AppsHandler) handleWeeklyImpression(c *gin.Context, collection *mongo.Collection, filter bson.M, location *time.Location) {
+	// Cache key based on filter and time range
+	cacheKey := fmt.Sprintf("weekly_impression:%v:%s", filter, time.Now().Format("2006-01-02"))
+	var response HourlyResponse
+
+	// Try to get from cache first, but don't fail if cache is unavailable
+	err := h.getFromCache(cacheKey, &response)
+	if err == nil {
+		c.JSON(http.StatusOK, response)
+		return
+	}
+
 	now := time.Now().In(location)
 	startOfWeek := now.AddDate(0, 0, -int(now.Weekday()))
 	startOfWeek = time.Date(startOfWeek.Year(), startOfWeek.Month(), startOfWeek.Day(), 0, 0, 0, 0, location)
@@ -632,7 +638,8 @@ func (h *AppsHandler) handleWeeklyImpression(c *gin.Context, collection *mongo.C
 		"$lt":  endOfWeek.Unix(),
 	}
 
-	pipeline := []bson.M{
+	// First pipeline to get daily counts
+	dailyPipeline := []bson.M{
 		{"$match": filter},
 		{
 			"$group": bson.M{
@@ -648,35 +655,90 @@ func (h *AppsHandler) handleWeeklyImpression(c *gin.Context, collection *mongo.C
 		{"$sort": bson.M{"_id": 1}},
 	}
 
-	cursor, err := collection.Aggregate(context.Background(), pipeline)
+	// Execute daily counts pipeline
+	dailyCursor, err := collection.Aggregate(context.Background(), dailyPipeline, options.Aggregate().SetAllowDiskUse(true))
 	if err != nil {
-		h.errorRes(c, "Failed to fetch data")
+		h.errorRes(c, "Failed to fetch daily data")
 		return
 	}
-	defer cursor.Close(context.Background())
+	defer dailyCursor.Close(context.Background())
 
-	var results []bson.M
-	if err := cursor.All(context.Background(), &results); err != nil {
-		h.errorRes(c, "Failed to process data")
+	var dailyResults []struct {
+		ID    string `bson:"_id"`
+		Count int64  `bson:"count"`
+	}
+	if err := dailyCursor.All(context.Background(), &dailyResults); err != nil {
+		h.errorRes(c, "Failed to process daily data")
 		return
 	}
 
+	// Process daily results and prepare for ad_id counts
 	var impressions []HourlyImpression
 	var totalCount int64
+	dateMap := make(map[string]*HourlyImpression)
 
-	for _, result := range results {
-		count := result["count"].(int32)
-		totalCount += int64(count)
-		impressions = append(impressions, HourlyImpression{
-			Count: int64(count),
-			Range: result["_id"].(string),
-		})
+	for _, result := range dailyResults {
+		imp := HourlyImpression{
+			Count:        result.Count,
+			Range:        result.ID,
+			IdBasedCount: make(map[int32]int32),
+		}
+		dateMap[result.ID] = &imp
+		impressions = append(impressions, imp)
+		totalCount += result.Count
 	}
 
-	response := HourlyResponse{
+	// Second pipeline for ad_id counts (only if there are results)
+	if len(dailyResults) > 0 {
+		adPipeline := []bson.M{
+			{"$match": filter},
+			{
+				"$group": bson.M{
+					"_id": bson.M{
+						"date": bson.M{
+							"$dateToString": bson.M{
+								"format": "%Y-%m-%d",
+								"date":   bson.M{"$toDate": bson.M{"$multiply": []interface{}{"$timestamp", 1000}}},
+							},
+						},
+						"ad_id": "$ad_id",
+					},
+					"count": bson.M{"$sum": 1},
+				},
+			},
+		}
+
+		adCursor, err := collection.Aggregate(context.Background(), adPipeline, options.Aggregate().SetAllowDiskUse(true))
+		if err == nil {
+			defer adCursor.Close(context.Background())
+
+			for adCursor.Next(context.Background()) {
+				var result struct {
+					ID struct {
+						Date string `bson:"date"`
+						AdID int32  `bson:"ad_id"`
+					} `bson:"_id"`
+					Count int32 `bson:"count"`
+				}
+				if err := adCursor.Decode(&result); err != nil {
+					continue
+				}
+				if imp, ok := dateMap[result.ID.Date]; ok {
+					imp.IdBasedCount[result.ID.AdID] = result.Count
+				}
+			}
+		}
+	}
+
+	response = HourlyResponse{
 		Status:     "ok",
 		Data:       impressions,
 		TotalCount: totalCount,
+	}
+
+	// Save to cache, but don't fail if cache is unavailable
+	if err := h.saveToCache(cacheKey, response, 5*time.Minute); err != nil {
+		log.Printf("Warning: Failed to cache weekly impression data: %v", err)
 	}
 
 	c.JSON(http.StatusOK, response)
@@ -752,51 +814,52 @@ func (h *AppsHandler) handleYesterdayImpression(c *gin.Context, collection *mong
 		"$lt":  endOfYesterday.Unix(),
 	}
 
-	pipeline := []bson.M{
-		{"$match": filter},
-		{
-			"$group": bson.M{
-				"_id": bson.M{
-					"hour": bson.M{
-						"$hour": bson.M{
-							"$toDate": bson.M{"$multiply": []interface{}{"$timestamp", 1000}},
-						},
-					},
-				},
-				"count": bson.M{"$sum": 1},
-			},
-		},
-		{"$sort": bson.M{"_id.hour": 1}},
-	}
-
-	cursor, err := collection.Aggregate(context.Background(), pipeline)
+	cursor, err := collection.Find(context.Background(), filter)
 	if err != nil {
 		h.errorRes(c, "Failed to fetch data")
 		return
 	}
 	defer cursor.Close(context.Background())
 
-	var results []bson.M
-	if err := cursor.All(context.Background(), &results); err != nil {
-		h.errorRes(c, "Failed to process data")
-		return
-	}
-
 	impressions := make([]HourlyImpression, 24)
 	var totalCount int64
 
+	// Initialize all hours
 	for i := 0; i < 24; i++ {
 		startHour := startOfYesterday.Add(time.Duration(i) * time.Hour)
 		endHour := startHour.Add(time.Hour)
-		impressions[i].Range = fmt.Sprintf("%s_%s", startHour.Format("3:04pm"), endHour.Format("3:04pm"))
+		impressions[i] = HourlyImpression{
+			Range:             fmt.Sprintf("%s_%s", startHour.Format("3:04pm"), endHour.Format("3:04pm")),
+			IdBasedCount:      make(map[int32]int32),
+			CompanyBasedCount: make(map[int32]int32),
+		}
 	}
 
-	for _, result := range results {
-		hour := result["_id"].(bson.M)["hour"].(int32)
-		count := result["count"].(int32)
+	// Process the data
+	for cursor.Next(context.Background()) {
+		var result bson.M
+		if err := cursor.Decode(&result); err != nil {
+			continue
+		}
+
+		timestamp := int64(result["timestamp"].(int32))
+		recordTime := time.Unix(timestamp, 0)
+		hour := recordTime.Hour()
+
 		if hour >= 0 && hour < 24 {
-			impressions[hour].Count = int64(count)
-			totalCount += int64(count)
+			impressions[hour].Count++
+
+			// Track ad_id based count
+			if adID, ok := result["ad_id"].(int32); ok {
+				impressions[hour].IdBasedCount[adID]++
+			}
+
+			// Track company based count
+			if company, ok := result["company"].(int32); ok {
+				impressions[hour].CompanyBasedCount[company]++
+			}
+
+			totalCount++
 		}
 	}
 
@@ -836,45 +899,307 @@ func (h *AppsHandler) handleCustomDateImpression(c *gin.Context, collection *mon
 		"$lt":  endDate.Unix(),
 	}
 
-	pipeline := []bson.M{
-		{"$match": filter},
-		{
-			"$group": bson.M{
-				"_id": bson.M{
-					"$dateToString": bson.M{
-						"format": "%Y-%m-%d",
-						"date":   bson.M{"$toDate": bson.M{"$multiply": []interface{}{"$timestamp", 1000}}},
-					},
-				},
-				"count": bson.M{"$sum": 1},
-			},
-		},
-		{"$sort": bson.M{"_id": 1}},
-	}
-
-	cursor, err := collection.Aggregate(context.Background(), pipeline)
+	cursor, err := collection.Find(context.Background(), filter)
 	if err != nil {
 		h.errorRes(c, "Failed to fetch data")
 		return
 	}
 	defer cursor.Close(context.Background())
 
-	var results []bson.M
-	if err := cursor.All(context.Background(), &results); err != nil {
-		h.errorRes(c, "Failed to process data")
+	// Use a map to store daily counts
+	dailyData := make(map[string]*HourlyImpression)
+	var totalCount int64
+
+	// Process the data
+	for cursor.Next(context.Background()) {
+		var result bson.M
+		if err := cursor.Decode(&result); err != nil {
+			continue
+		}
+
+		timestamp := int64(result["timestamp"].(int32))
+		recordTime := time.Unix(timestamp, 0)
+		dateStr := recordTime.Format("2006-01-02")
+
+		// Initialize the daily entry if it doesn't exist
+		if _, exists := dailyData[dateStr]; !exists {
+			dailyData[dateStr] = &HourlyImpression{
+				Range:             dateStr,
+				IdBasedCount:      make(map[int32]int32),
+				CompanyBasedCount: make(map[int32]int32),
+			}
+		}
+
+		dailyData[dateStr].Count++
+
+		// Track ad_id based count
+		if adID, ok := result["ad_id"].(int32); ok {
+			dailyData[dateStr].IdBasedCount[adID]++
+		}
+
+		// Track company based count
+		if company, ok := result["company"].(int32); ok {
+			dailyData[dateStr].CompanyBasedCount[company]++
+		}
+
+		totalCount++
+	}
+
+	// Convert map to sorted slice
+	var impressions []HourlyImpression
+	for _, data := range dailyData {
+		impressions = append(impressions, *data)
+	}
+
+	// Sort impressions by date
+	sort.Slice(impressions, func(i, j int) bool {
+		return impressions[i].Range < impressions[j].Range
+	})
+
+	response := HourlyResponse{
+		Status:     "ok",
+		Data:       impressions,
+		TotalCount: totalCount,
+	}
+
+	c.JSON(http.StatusOK, response)
+}
+
+func (h *AppsHandler) GetImpressionByCompany(c *gin.Context) {
+	dbtype := c.Query("db_type")
+	daysType := c.Query("days_type")
+	company := c.Query("company")
+	timeZone := c.Query("timeZone")
+	dates := c.Query("date")
+
+	var companyID int32
+	if company != "" {
+		id, err := strconv.Atoi(company)
+		if err != nil {
+			h.errorRes(c, "Invalid company ID")
+			return
+		}
+		companyID = int32(id)
+	}
+
+	istLocation, err := h.setTimeZone(timeZone)
+	if err != nil {
+		h.errorRes(c, err.Error())
+		return
+	}
+
+	switch daysType {
+	case "today":
+		h.handleTodayImpressionByCompany(c, dbtype, companyID, istLocation)
+	case "yesterday":
+		h.handleYesterdayImpressionByCompany(c, dbtype, companyID, istLocation)
+	case "custom":
+		h.handleCustomDateImpressionByCompany(c, dbtype, companyID, dates)
+	default:
+		h.errorRes(c, "Invalid days_type parameter")
+	}
+}
+
+func (h *AppsHandler) handleTodayImpressionByCompany(c *gin.Context, dbtype string, companyID int32, location *time.Location) {
+	now := time.Now().In(location)
+	currentDate := now.Format("2006-01-02")
+
+	// Process each hour up to current hour
+	var impressions []HourlyImpression
+	var totalCount int64
+
+	for hour := 0; hour < now.Hour()+1; hour++ {
+		startHour := time.Date(now.Year(), now.Month(), now.Day(), hour, 0, 0, 0, location)
+		cacheKey := fmt.Sprintf("today:%s:%02d:%s", currentDate, hour, dbtype)
+
+		// Try to get data from cache
+		var cachedData []CachedImpressionData
+		err := h.getFromCache(cacheKey, &cachedData)
+
+		if err != nil {
+			// Cache miss - fetch from MongoDB and cache it
+			endHour := startHour.Add(time.Hour)
+
+			cachedData, err = h.fetchAndCacheHourlyData(dbtype, startHour, endHour, cacheKey, 24*time.Hour)
+			if err != nil {
+				log.Printf("Error fetching data for hour %d: %v", hour, err)
+				continue
+			}
+		}
+
+		// Process hour data
+		hourData := h.processHourlyData(cachedData, companyID, hour, startHour)
+		impressions = append(impressions, hourData)
+		totalCount += hourData.Count
+	}
+
+	response := HourlyResponse{
+		Status:     "ok",
+		Data:       impressions,
+		TotalCount: totalCount,
+		Date:       &currentDate,
+	}
+
+	c.JSON(http.StatusOK, response)
+}
+
+func (h *AppsHandler) fetchAndCacheHourlyData(dbtype string, startTime, endTime time.Time, cacheKey string, expiry time.Duration) ([]CachedImpressionData, error) {
+	collection := h.mongodb.GetCollection(h.cfg.AppDBName, h.getTableName(dbtype))
+
+	filter := bson.M{
+		"timestamp": bson.M{
+			"$gte": startTime.Unix(),
+			"$lt":  endTime.Unix(),
+		},
+	}
+
+	cursor, err := collection.Find(context.Background(), filter)
+	if err != nil {
+		return nil, err
+	}
+	defer cursor.Close(context.Background())
+
+	var data []CachedImpressionData
+	for cursor.Next(context.Background()) {
+		var result bson.M
+		if err := cursor.Decode(&result); err != nil {
+			continue
+		}
+
+		item := CachedImpressionData{
+			Timestamp: int64(result["timestamp"].(int32)),
+			AdID:      result["ad_id"].(int32),
+			Company:   result["company"].(int32),
+		}
+		data = append(data, item)
+	}
+
+	// Cache the data
+	if err := h.saveToCache(cacheKey, data, expiry); err != nil {
+		log.Printf("Warning: Failed to cache data for key %s: %v", cacheKey, err)
+	}
+
+	return data, nil
+}
+
+func (h *AppsHandler) processHourlyData(data []CachedImpressionData, companyID int32, hour int, startHour time.Time) HourlyImpression {
+	endHour := startHour.Add(time.Hour)
+	impression := HourlyImpression{
+		Range:             fmt.Sprintf("%s_%s", startHour.Format("3:04pm"), endHour.Format("3:04pm")),
+		IdBasedCount:      make(map[int32]int32),
+		CompanyBasedCount: make(map[int32]int32),
+	}
+
+	for _, item := range data {
+		// Apply company filter if specified
+		if companyID != 0 && item.Company != companyID {
+			continue
+		}
+
+		impression.Count++
+		impression.IdBasedCount[item.AdID]++
+		impression.CompanyBasedCount[item.Company]++
+	}
+
+	return impression
+}
+
+func (h *AppsHandler) getTableName(dbtype string) string {
+	if dbtype == "click_info" {
+		return h.cfg.AppDBTableCli
+	}
+	return h.cfg.AppDBTableImp
+}
+
+func (h *AppsHandler) handleYesterdayImpressionByCompany(c *gin.Context, dbtype string, companyID int32, location *time.Location) {
+	now := time.Now().In(location)
+	startOfYesterday := time.Date(now.Year(), now.Month(), now.Day()-1, 0, 0, 0, 0, location)
+	yesterdayDate := startOfYesterday.Format("2006-01-02")
+
+	var impressions []HourlyImpression
+	var totalCount int64
+
+	// Process all 24 hours of yesterday
+	for hour := 0; hour < 24; hour++ {
+		hourStart := startOfYesterday.Add(time.Duration(hour) * time.Hour)
+		cacheKey := fmt.Sprintf("yesterday:%s:%02d:%s", yesterdayDate, hour, dbtype)
+
+		// Try to get data from cache
+		var cachedData []CachedImpressionData
+		err := h.getFromCache(cacheKey, &cachedData)
+
+		if err != nil {
+			// Cache miss - fetch from MongoDB and cache it
+			endHour := hourStart.Add(time.Hour)
+
+			cachedData, err = h.fetchAndCacheHourlyData(dbtype, hourStart, endHour, cacheKey, 48*time.Hour)
+			if err != nil {
+				log.Printf("Error fetching data for hour %d: %v", hour, err)
+				continue
+			}
+		}
+
+		// Process hour data
+		hourData := h.processHourlyData(cachedData, companyID, hour, hourStart)
+		impressions = append(impressions, hourData)
+		totalCount += hourData.Count
+	}
+
+	response := HourlyResponse{
+		Status:     "ok",
+		Data:       impressions,
+		TotalCount: totalCount,
+		Date:       &yesterdayDate,
+	}
+
+	c.JSON(http.StatusOK, response)
+}
+
+func (h *AppsHandler) handleCustomDateImpressionByCompany(c *gin.Context, dbtype string, companyID int32, dates string) {
+	dateRange := strings.Split(dates, "_")
+	if len(dateRange) != 2 {
+		h.errorRes(c, "Invalid date range format")
+		return
+	}
+
+	startDate, err := time.Parse("02-01-2006", dateRange[0])
+	if err != nil {
+		h.errorRes(c, "Invalid start date format")
+		return
+	}
+
+	endDate, err := time.Parse("02-01-2006", dateRange[1])
+	if err != nil {
+		h.errorRes(c, "Invalid end date format")
 		return
 	}
 
 	var impressions []HourlyImpression
 	var totalCount int64
 
-	for _, result := range results {
-		count := result["count"].(int32)
-		totalCount += int64(count)
-		impressions = append(impressions, HourlyImpression{
-			Count: int64(count),
-			Range: result["_id"].(string),
-		})
+	// Process each day in the range
+	for d := startDate; !d.After(endDate); d = d.AddDate(0, 0, 1) {
+		dateStr := d.Format("2006-01-02")
+		cacheKey := fmt.Sprintf("daily:%s:%s", dateStr, dbtype)
+
+		// Try to get data from cache
+		var cachedData []CachedImpressionData
+		err := h.getFromCache(cacheKey, &cachedData)
+
+		if err != nil {
+			// Cache miss - fetch from MongoDB and cache it
+			nextDay := d.AddDate(0, 0, 1)
+			cachedData, err = h.fetchAndCacheDailyData(dbtype, d, nextDay, cacheKey)
+			if err != nil {
+				log.Printf("Error fetching data for date %s: %v", dateStr, err)
+				continue
+			}
+		}
+
+		// Process daily data
+		dailyData := h.processDailyData(cachedData, companyID, dateStr)
+		impressions = append(impressions, dailyData)
+		totalCount += dailyData.Count
 	}
 
 	response := HourlyResponse{
@@ -884,4 +1209,85 @@ func (h *AppsHandler) handleCustomDateImpression(c *gin.Context, collection *mon
 	}
 
 	c.JSON(http.StatusOK, response)
+}
+
+func (h *AppsHandler) fetchAndCacheDailyData(dbtype string, startDate, endDate time.Time, cacheKey string) ([]CachedImpressionData, error) {
+	collection := h.mongodb.GetCollection(h.cfg.AppDBName, h.getTableName(dbtype))
+
+	filter := bson.M{
+		"timestamp": bson.M{
+			"$gte": startDate.Unix(),
+			"$lt":  endDate.Unix(),
+		},
+	}
+
+	cursor, err := collection.Find(context.Background(), filter)
+	if err != nil {
+		return nil, err
+	}
+	defer cursor.Close(context.Background())
+
+	var data []CachedImpressionData
+	for cursor.Next(context.Background()) {
+		var result bson.M
+		if err := cursor.Decode(&result); err != nil {
+			continue
+		}
+
+		item := CachedImpressionData{
+			Timestamp: int64(result["timestamp"].(int32)),
+			AdID:      result["ad_id"].(int32),
+			Company:   result["company"].(int32),
+		}
+		data = append(data, item)
+	}
+
+	// Calculate expiry (30 days from the date being cached)
+	expiry := time.Until(startDate.AddDate(0, 1, 0))
+
+	// Cache the data
+	if err := h.saveToCache(cacheKey, data, expiry); err != nil {
+		log.Printf("Warning: Failed to cache data for key %s: %v", cacheKey, err)
+	}
+
+	return data, nil
+}
+
+func (h *AppsHandler) processDailyData(data []CachedImpressionData, companyID int32, dateStr string) HourlyImpression {
+	impression := HourlyImpression{
+		Range:             dateStr,
+		IdBasedCount:      make(map[int32]int32),
+		CompanyBasedCount: make(map[int32]int32),
+	}
+
+	for _, item := range data {
+		// Apply company filter if specified
+		if companyID != 0 && item.Company != companyID {
+			continue
+		}
+
+		impression.Count++
+		impression.IdBasedCount[item.AdID]++
+		impression.CompanyBasedCount[item.Company]++
+	}
+
+	return impression
+}
+
+// Helper functions
+func hourTo12(hour int) int {
+	if hour == 0 {
+		return 12
+	}
+	if hour > 12 {
+		return hour - 12
+	}
+	return hour
+}
+
+func ampm(t time.Time) string {
+	if t.Hour() < 12 {
+		return "am"
+	}
+	return "pm"
 }
