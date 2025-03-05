@@ -24,6 +24,7 @@ type Config struct {
 	RedisAddr          string
 	RedisPassword      string
 	RedisDB            int
+	MySQLDSN           string
 
 	// New field for server port
 	ServerPort string
@@ -62,6 +63,7 @@ func LoadConfig() (*Config, error) {
 		RedisAddr:          os.Getenv("REDIS_ADDR"),
 		RedisPassword:      os.Getenv("REDIS_PASSWORD"),
 		RedisDB:            redisDB,
+		MySQLDSN:           os.Getenv("MYSQL_DSN"),
 
 		// New field
 		ServerPort: port,
