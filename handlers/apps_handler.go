@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -21,12 +22,17 @@ import (
 
 	"app-logs/config"
 	"app-logs/db"
+	"app-logs/utils"
 )
 
 type AppsHandler struct {
-	cfg     *config.Config
-	mongodb *db.MongoDB
-	redisDB *db.Redis
+	cfg        *config.Config
+	mongodb    *db.MongoDB
+	redisDB    *db.Redis
+	mysqlDB    *db.MySQL
+	timeUtils  *utils.TimeUtils
+	mongoUtils *utils.MongoUtils
+	capUtils   *utils.CappingUtils
 }
 
 type PostStr struct {
@@ -83,11 +89,15 @@ type CachedImpressionData struct {
 	Country   string `json:"country"`
 }
 
-func NewAppsHandler(cfg *config.Config, mongodb *db.MongoDB, redisDB *db.Redis) *AppsHandler {
+func NewAppsHandler(cfg *config.Config, mongodb *db.MongoDB, redisDB *db.Redis, mysqlDB *db.MySQL) *AppsHandler {
 	return &AppsHandler{
-		cfg:     cfg,
-		mongodb: mongodb,
-		redisDB: redisDB,
+		cfg:        cfg,
+		mongodb:    mongodb,
+		redisDB:    redisDB,
+		mysqlDB:    mysqlDB,
+		timeUtils:  utils.NewTimeUtils(),
+		mongoUtils: utils.NewMongoUtils(),
+		capUtils:   utils.NewCappingUtils(),
 	}
 }
 
@@ -327,6 +337,10 @@ func (h *AppsHandler) SaveAppData(c *gin.Context) {
 		return
 	}
 
+	// Use utility functions
+	currentTime := time.Now().Unix()
+	roundedTimestamp := h.timeUtils.RoundToTenMinutes(currentTime)
+
 	tableName := ""
 	if postData.From == "click" {
 		tableName = h.cfg.AppDBTableCli
@@ -348,7 +362,7 @@ func (h *AppsHandler) SaveAppData(c *gin.Context) {
 
 	document := bson.M{
 		"firebase":  postData.Firebase,
-		"timestamp": int32(time.Now().Unix()),
+		"timestamp": roundedTimestamp,
 		"ad_id":     postData.Ad_id,
 		"type":      atype,
 		"ads_name":  postData.Ads_name,
@@ -1290,4 +1304,102 @@ func ampm(t time.Time) string {
 		return "am"
 	}
 	return "pm"
+}
+
+func (h *AppsHandler) checkImpressionCap(postData PostStr) (bool, error) {
+	// Get active capping rules from MySQL
+	query := `
+		SELECT base_rule, country_rules, time_rules 
+		FROM capping_rules 
+		WHERE ad_id = ? AND status = 1 
+		LIMIT 1
+	`
+
+	var baseRuleStr, countryRulesStr, timeRulesStr string
+	err := h.mysqlDB.DB.QueryRow(query, postData.Ad_id).Scan(&baseRuleStr, &countryRulesStr, &timeRulesStr)
+	if err == sql.ErrNoRows {
+		// No active capping rule found, allow impression
+		return true, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("error fetching capping rules: %v", err)
+	}
+
+	// Parse the base rule using existing utility
+	baseRule, err := h.capUtils.ParseBaseRule(baseRuleStr)
+	if err != nil {
+		return false, err
+	}
+
+	// Validate that the ad_id matches
+	if baseRule.AdID != 0 && baseRule.AdID != int(postData.Ad_id) {
+		return false, fmt.Errorf("ad ID mismatch")
+	}
+
+	// If there are specific ad IDs to check
+	if baseRule.AdIDs != "" {
+		adIDs := strings.Split(baseRule.AdIDs, ",")
+		found := false
+		for _, id := range adIDs {
+			if id == strconv.Itoa(int(postData.Ad_id)) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false, fmt.Errorf("ad ID not in allowed list")
+		}
+	}
+
+	// Check company if specified
+	if baseRule.Company != 0 && baseRule.Company != int(postData.ComapnyId) {
+		return false, fmt.Errorf("company mismatch")
+	}
+
+	// Check type if specified
+	adType, _ := strconv.Atoi(postData.Type)
+	if baseRule.Type != 0 && baseRule.Type != adType {
+		return false, fmt.Errorf("type mismatch")
+	}
+
+	// Additional capping logic can be added here
+	// For example, checking country_rules and time_rules
+
+	return true, nil
+}
+
+func (h *AppsHandler) GetAdCappingRules() ([]utils.BaseRule, error) {
+	query := `
+		SELECT base_rule 
+		FROM capping_rules 
+		WHERE status = 1
+	`
+
+	rows, err := h.mysqlDB.DB.Query(query)
+	if err != nil {
+		return nil, fmt.Errorf("error fetching capping rules: %v", err)
+	}
+	defer rows.Close()
+
+	var rules []utils.BaseRule
+	for rows.Next() {
+		var baseRuleStr string
+		err := rows.Scan(&baseRuleStr)
+		if err != nil {
+			return nil, fmt.Errorf("error scanning rule: %v", err)
+		}
+
+		baseRule, err := h.capUtils.ParseBaseRule(baseRuleStr)
+		if err != nil {
+			continue // Skip invalid rules
+		}
+
+		rules = append(rules, *baseRule)
+	}
+
+	if err = rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating rules: %v", err)
+	}
+
+	return rules, nil
 }

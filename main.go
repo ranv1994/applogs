@@ -35,9 +35,16 @@ func main() {
 	}
 	defer redisDB.Close()
 
+	// Initialize MySQL connection
+	mysqlDB, err := db.NewMySQL(cfg.MySQLDSN)
+	if err != nil {
+		log.Fatal("Error connecting to MySQL:", err)
+	}
+	defer mysqlDB.Close()
+
 	// Initialize handlers
 	logsHandler := handlers.NewLogsHandler(cfg, mongodb, redisDB)
-	appsHandler := handlers.NewAppsHandler(cfg, mongodb, redisDB)
+	appsHandler := handlers.NewAppsHandler(cfg, mongodb, redisDB, mysqlDB)
 
 	// Setup router with all routes
 	router := routes.SetupRouter(logsHandler, appsHandler)
