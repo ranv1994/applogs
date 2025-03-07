@@ -7,7 +7,7 @@ import (
 )
 
 // SetupRouter sets up all the routes for the application
-func SetupRouter(logsHandler *handlers.LogsHandler, appsHandler *handlers.AppsHandler) *gin.Engine {
+func SetupRouter(logsHandler *handlers.LogsHandler, appsHandler *handlers.AppsHandler, cappingHandler *handlers.CappingHandler) *gin.Engine {
 	// Set up Gin router
 	router := gin.Default()
 
@@ -23,6 +23,9 @@ func SetupRouter(logsHandler *handlers.LogsHandler, appsHandler *handlers.AppsHa
 	router.GET("/impression_hourly", appsHandler.HourlyGetImpression)
 	router.GET("/country_timezone", appsHandler.GetTimezone)
 	router.GET("/impression_by_company", appsHandler.GetImpressionByCompany)
+	
+	// Capping routes
+	router.GET("/update-capping-count", cappingHandler.UpdateCappingCount)
 
 	return router
 }

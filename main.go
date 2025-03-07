@@ -45,9 +45,10 @@ func main() {
 	// Initialize handlers
 	logsHandler := handlers.NewLogsHandler(cfg, mongodb, redisDB)
 	appsHandler := handlers.NewAppsHandler(cfg, mongodb, redisDB, mysqlDB)
+	cappingHandler := handlers.NewCappingHandler(cfg, mongodb, redisDB, mysqlDB)
 
 	// Setup router with all routes
-	router := routes.SetupRouter(logsHandler, appsHandler)
+	router := routes.SetupRouter(logsHandler, appsHandler, cappingHandler)
 
 	// Start the server with configured port
 	if err := router.Run("0.0.0.0:" + cfg.ServerPort); err != nil {

@@ -20,12 +20,14 @@ import (
 
 	"app-logs/config"
 	"app-logs/db"
+	"app-logs/utils"
 )
 
 type LogsHandler struct {
-	cfg     *config.Config
-	mongodb *db.MongoDB
-	redisDB *db.Redis
+	cfg        *config.Config
+	mongodb    *db.MongoDB
+	cacheUtils *utils.CacheUtils
+	respUtils  *utils.ResponseUtils
 }
 
 type LogData struct {
@@ -45,9 +47,10 @@ type CustomResponse struct {
 
 func NewLogsHandler(cfg *config.Config, mongodb *db.MongoDB, redisDB *db.Redis) *LogsHandler {
 	return &LogsHandler{
-		cfg:     cfg,
-		mongodb: mongodb,
-		redisDB: redisDB,
+		cfg:        cfg,
+		mongodb:    mongodb,
+		cacheUtils: utils.NewCacheUtils(redisDB),
+		respUtils:  utils.NewResponseUtils(),
 	}
 }
 

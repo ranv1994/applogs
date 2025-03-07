@@ -2,7 +2,6 @@ package handlers
 
 import (
 	"context"
-	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -28,11 +27,11 @@ import (
 type AppsHandler struct {
 	cfg        *config.Config
 	mongodb    *db.MongoDB
-	redisDB    *db.Redis
-	mysqlDB    *db.MySQL
+	cacheUtils *utils.CacheUtils
+	respUtils  *utils.ResponseUtils
 	timeUtils  *utils.TimeUtils
 	mongoUtils *utils.MongoUtils
-	capUtils   *utils.CappingUtils
+	mysqlDB    *db.MySQL
 }
 
 type PostStr struct {
@@ -93,39 +92,16 @@ func NewAppsHandler(cfg *config.Config, mongodb *db.MongoDB, redisDB *db.Redis, 
 	return &AppsHandler{
 		cfg:        cfg,
 		mongodb:    mongodb,
-		redisDB:    redisDB,
-		mysqlDB:    mysqlDB,
+		cacheUtils: utils.NewCacheUtils(redisDB),
+		respUtils:  utils.NewResponseUtils(),
 		timeUtils:  utils.NewTimeUtils(),
 		mongoUtils: utils.NewMongoUtils(),
-		capUtils:   utils.NewCappingUtils(),
+		mysqlDB:    mysqlDB,
 	}
-}
-
-func (h *AppsHandler) saveToCache(key string, value interface{}, expiration time.Duration) error {
-	if h.redisDB == nil {
-		return nil // Silently ignore if no cache is available
-	}
-
-	// Use the Redis interface method which handles both Redis and memory cache
-	return h.redisDB.Set(key, value, expiration)
-}
-
-func (h *AppsHandler) getFromCache(key string, value interface{}) error {
-	if h.redisDB == nil {
-		return db.ErrCacheMiss
-	}
-
-	// Use the Redis interface method which handles both Redis and memory cache
-	return h.redisDB.Get(key, value)
 }
 
 func (h *AppsHandler) errorRes(c *gin.Context, message string) {
-	response := ErrorResponse{
-		Status:     "error",
-		Message:    message,
-		AppVersion: "3.0.1",
-	}
-	c.JSON(http.StatusOK, response)
+	h.respUtils.ErrorResponse(c, message)
 }
 
 func (h *AppsHandler) GetImpression(c *gin.Context) {
@@ -439,7 +415,7 @@ func (h *AppsHandler) getcompanyId(adId int32) (int32, error) {
 	cacheKey := "company_ads_list"
 	var cachedCompanies []CompanyAd
 
-	err := h.getFromCache(cacheKey, &cachedCompanies)
+	err := h.cacheUtils.GetFromCache(cacheKey, &cachedCompanies)
 	if err != nil {
 		// Cache miss - fetch from API
 		resp, err := http.Get("https://dev.cricket.entitysport.com/user/companies_ads")
@@ -459,7 +435,7 @@ func (h *AppsHandler) getcompanyId(adId int32) (int32, error) {
 		}
 
 		// Store full response in cache
-		if err := h.saveToCache(cacheKey, cachedCompanies, 10*time.Minute); err != nil {
+		if err := h.cacheUtils.SaveToCache(cacheKey, cachedCompanies, 10*time.Minute); err != nil {
 			log.Printf("warning: failed to store data in cache: %v", err)
 		}
 	}
@@ -636,7 +612,7 @@ func (h *AppsHandler) handleWeeklyImpression(c *gin.Context, collection *mongo.C
 	var response HourlyResponse
 
 	// Try to get from cache first, but don't fail if cache is unavailable
-	err := h.getFromCache(cacheKey, &response)
+	err := h.cacheUtils.GetFromCache(cacheKey, &response)
 	if err == nil {
 		c.JSON(http.StatusOK, response)
 		return
@@ -751,7 +727,7 @@ func (h *AppsHandler) handleWeeklyImpression(c *gin.Context, collection *mongo.C
 	}
 
 	// Save to cache, but don't fail if cache is unavailable
-	if err := h.saveToCache(cacheKey, response, 5*time.Minute); err != nil {
+	if err := h.cacheUtils.SaveToCache(cacheKey, response, 5*time.Minute); err != nil {
 		log.Printf("Warning: Failed to cache weekly impression data: %v", err)
 	}
 
@@ -1028,7 +1004,7 @@ func (h *AppsHandler) handleTodayImpressionByCompany(c *gin.Context, dbtype stri
 
 		// Try to get data from cache
 		var cachedData []CachedImpressionData
-		err := h.getFromCache(cacheKey, &cachedData)
+		err := h.cacheUtils.GetFromCache(cacheKey, &cachedData)
 
 		if err != nil {
 			// Cache miss - fetch from MongoDB and cache it
@@ -1089,7 +1065,7 @@ func (h *AppsHandler) fetchAndCacheHourlyData(dbtype string, startTime, endTime 
 	}
 
 	// Cache the data
-	if err := h.saveToCache(cacheKey, data, expiry); err != nil {
+	if err := h.cacheUtils.SaveToCache(cacheKey, data, expiry); err != nil {
 		log.Printf("Warning: Failed to cache data for key %s: %v", cacheKey, err)
 	}
 
@@ -1140,7 +1116,7 @@ func (h *AppsHandler) handleYesterdayImpressionByCompany(c *gin.Context, dbtype 
 
 		// Try to get data from cache
 		var cachedData []CachedImpressionData
-		err := h.getFromCache(cacheKey, &cachedData)
+		err := h.cacheUtils.GetFromCache(cacheKey, &cachedData)
 
 		if err != nil {
 			// Cache miss - fetch from MongoDB and cache it
@@ -1198,7 +1174,7 @@ func (h *AppsHandler) handleCustomDateImpressionByCompany(c *gin.Context, dbtype
 
 		// Try to get data from cache
 		var cachedData []CachedImpressionData
-		err := h.getFromCache(cacheKey, &cachedData)
+		err := h.cacheUtils.GetFromCache(cacheKey, &cachedData)
 
 		if err != nil {
 			// Cache miss - fetch from MongoDB and cache it
@@ -1260,7 +1236,7 @@ func (h *AppsHandler) fetchAndCacheDailyData(dbtype string, startDate, endDate t
 	expiry := time.Until(startDate.AddDate(0, 1, 0))
 
 	// Cache the data
-	if err := h.saveToCache(cacheKey, data, expiry); err != nil {
+	if err := h.cacheUtils.SaveToCache(cacheKey, data, expiry); err != nil {
 		log.Printf("Warning: Failed to cache data for key %s: %v", cacheKey, err)
 	}
 
@@ -1304,102 +1280,4 @@ func ampm(t time.Time) string {
 		return "am"
 	}
 	return "pm"
-}
-
-func (h *AppsHandler) checkImpressionCap(postData PostStr) (bool, error) {
-	// Get active capping rules from MySQL
-	query := `
-		SELECT base_rule, country_rules, time_rules 
-		FROM capping_rules 
-		WHERE ad_id = ? AND status = 1 
-		LIMIT 1
-	`
-
-	var baseRuleStr, countryRulesStr, timeRulesStr string
-	err := h.mysqlDB.DB.QueryRow(query, postData.Ad_id).Scan(&baseRuleStr, &countryRulesStr, &timeRulesStr)
-	if err == sql.ErrNoRows {
-		// No active capping rule found, allow impression
-		return true, nil
-	}
-	if err != nil {
-		return false, fmt.Errorf("error fetching capping rules: %v", err)
-	}
-
-	// Parse the base rule using existing utility
-	baseRule, err := h.capUtils.ParseBaseRule(baseRuleStr)
-	if err != nil {
-		return false, err
-	}
-
-	// Validate that the ad_id matches
-	if baseRule.AdID != 0 && baseRule.AdID != int(postData.Ad_id) {
-		return false, fmt.Errorf("ad ID mismatch")
-	}
-
-	// If there are specific ad IDs to check
-	if baseRule.AdIDs != "" {
-		adIDs := strings.Split(baseRule.AdIDs, ",")
-		found := false
-		for _, id := range adIDs {
-			if id == strconv.Itoa(int(postData.Ad_id)) {
-				found = true
-				break
-			}
-		}
-		if !found {
-			return false, fmt.Errorf("ad ID not in allowed list")
-		}
-	}
-
-	// Check company if specified
-	if baseRule.Company != 0 && baseRule.Company != int(postData.ComapnyId) {
-		return false, fmt.Errorf("company mismatch")
-	}
-
-	// Check type if specified
-	adType, _ := strconv.Atoi(postData.Type)
-	if baseRule.Type != 0 && baseRule.Type != adType {
-		return false, fmt.Errorf("type mismatch")
-	}
-
-	// Additional capping logic can be added here
-	// For example, checking country_rules and time_rules
-
-	return true, nil
-}
-
-func (h *AppsHandler) GetAdCappingRules() ([]utils.BaseRule, error) {
-	query := `
-		SELECT base_rule 
-		FROM capping_rules 
-		WHERE status = 1
-	`
-
-	rows, err := h.mysqlDB.DB.Query(query)
-	if err != nil {
-		return nil, fmt.Errorf("error fetching capping rules: %v", err)
-	}
-	defer rows.Close()
-
-	var rules []utils.BaseRule
-	for rows.Next() {
-		var baseRuleStr string
-		err := rows.Scan(&baseRuleStr)
-		if err != nil {
-			return nil, fmt.Errorf("error scanning rule: %v", err)
-		}
-
-		baseRule, err := h.capUtils.ParseBaseRule(baseRuleStr)
-		if err != nil {
-			continue // Skip invalid rules
-		}
-
-		rules = append(rules, *baseRule)
-	}
-
-	if err = rows.Err(); err != nil {
-		return nil, fmt.Errorf("error iterating rules: %v", err)
-	}
-
-	return rules, nil
 }
