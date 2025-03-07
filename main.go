@@ -44,7 +44,7 @@ func main() {
 
 	// Initialize handlers
 	logsHandler := handlers.NewLogsHandler(cfg, mongodb, redisDB)
-	appsHandler := handlers.NewAppsHandler(cfg, mongodb, redisDB, mysqlDB)
+	appsHandler := handlers.NewAppsHandler(cfg, mongodb, redisDB)
 	cappingHandler := handlers.NewCappingHandler(cfg, mongodb, redisDB, mysqlDB)
 
 	// Setup router with all routes

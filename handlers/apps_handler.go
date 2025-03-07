@@ -31,7 +31,6 @@ type AppsHandler struct {
 	respUtils  *utils.ResponseUtils
 	timeUtils  *utils.TimeUtils
 	mongoUtils *utils.MongoUtils
-	mysqlDB    *db.MySQL
 }
 
 type PostStr struct {
@@ -88,7 +87,7 @@ type CachedImpressionData struct {
 	Country   string `json:"country"`
 }
 
-func NewAppsHandler(cfg *config.Config, mongodb *db.MongoDB, redisDB *db.Redis, mysqlDB *db.MySQL) *AppsHandler {
+func NewAppsHandler(cfg *config.Config, mongodb *db.MongoDB, redisDB *db.Redis) *AppsHandler {
 	return &AppsHandler{
 		cfg:        cfg,
 		mongodb:    mongodb,
@@ -96,7 +95,6 @@ func NewAppsHandler(cfg *config.Config, mongodb *db.MongoDB, redisDB *db.Redis, 
 		respUtils:  utils.NewResponseUtils(),
 		timeUtils:  utils.NewTimeUtils(),
 		mongoUtils: utils.NewMongoUtils(),
-		mysqlDB:    mysqlDB,
 	}
 }
 

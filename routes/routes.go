@@ -23,9 +23,10 @@ func SetupRouter(logsHandler *handlers.LogsHandler, appsHandler *handlers.AppsHa
 	router.GET("/impression_hourly", appsHandler.HourlyGetImpression)
 	router.GET("/country_timezone", appsHandler.GetTimezone)
 	router.GET("/impression_by_company", appsHandler.GetImpressionByCompany)
-	
+
 	// Capping routes
 	router.GET("/update-capping-count", cappingHandler.UpdateCappingCount)
+	router.GET("/update-capping-status", cappingHandler.UpdateCappingStatus)
 
 	return router
 }
